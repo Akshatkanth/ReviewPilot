@@ -1,0 +1,7 @@
+PyGithub
+python-dotenv
+langgraph
+langchain-groq
+bandit
+coverage
+pydantic
