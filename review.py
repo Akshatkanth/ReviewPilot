@@ -4,6 +4,8 @@ import sys
 from dotenv import load_dotenv
 import os
 from github import Github, Auth, GithubException
+from langchain_groq import ChatGroq
+from langchain_core.messages import HumanMessage
 
 # Load environment variables from .env
 load_dotenv()
@@ -14,6 +16,46 @@ def parse_args():
     parser.add_argument("--repo", required=True, help="Repository in 'owner/reponame' format")
     parser.add_argument("--pr", required=True, type=int, help="Pull request number")
     return parser.parse_args()
+
+
+def test_llm_connection():
+    """Send a hardcoded prompt to Groq and print the response + token usage."""
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    if not groq_api_key:
+        print("Error: GROQ_API_KEY not found in environment. Check your .env file.")
+        sys.exit(1)
+
+    print(f"\n{'='*50}")
+    print("  LLM CONNECTION TEST")
+    print(f"{'='*50}")
+
+    # ChatGroq is a LangChain wrapper around the Groq cloud API.
+    # It handles auth, request formatting, and response parsing for us.
+    # "llama-3.3-70b-versatile" = Meta's Llama 3.3 model, 70 billion parameters,
+    # hosted on Groq's ultra-fast inference hardware (LPU chips).
+    llm = ChatGroq(
+        model="llama-3.3-70b-versatile",
+        api_key=groq_api_key,
+    )
+
+    prompt = "In one sentence, explain what a pull request is."
+    print(f"  Prompt  : {prompt}")
+
+    # llm.invoke() sends the message list to Groq and returns an AIMessage object.
+    response = llm.invoke([HumanMessage(content=prompt)])
+
+    print(f"  Response: {response.content}")
+
+    # Token usage is attached to response.response_metadata by langchain-groq
+    usage = response.response_metadata.get("token_usage", {})
+    if usage:
+        print(f"  Tokens  : {usage.get('prompt_tokens', '?')} prompt "
+              f"+ {usage.get('completion_tokens', '?')} completion "
+              f"= {usage.get('total_tokens', '?')} total")
+    else:
+        print("  Tokens  : (usage metadata not available)")
+
+    print(f"{'='*50}\n")
 
 
 def main():
@@ -97,6 +139,9 @@ def main():
         })
 
     print(f"[INFO] Stored full diff data for {len(python_diffs)} Python file(s) in memory.")
+
+    # Step 3: Test LLM connection (isolated, no diff logic yet)
+    test_llm_connection()
 
 
 if __name__ == "__main__":
