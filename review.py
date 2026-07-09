@@ -1,5 +1,8 @@
 import argparse
+import json
+import subprocess
 import sys
+import tempfile
 
 from dotenv import load_dotenv
 import os
@@ -56,6 +59,94 @@ def test_llm_connection():
         print("  Tokens  : (usage metadata not available)")
 
     print(f"{'='*50}\n")
+
+
+def run_bandit_scan(python_files, repo, pr):
+    """
+    Runs bandit static security analysis on each changed Python file.
+
+    Strategy: fetch the full file content at the PR's head commit from GitHub
+    (not just the patch fragment), write it to a temporary .py file so bandit
+    has a complete, valid Python source to analyse, run bandit via subprocess
+    with JSON output, parse and print findings, then delete the temp file.
+
+    Args:
+        python_files: list of PullRequestFile objects from pr.get_files()
+        repo:         PyGithub Repository object (needed for get_contents)
+        pr:           PyGithub PullRequest object (needed for head SHA)
+    """
+    head_sha = pr.head.sha
+
+    print(f"\n{'='*50}")
+    print("  BANDIT SECURITY SCAN")
+    print(f"{'='*50}\n")
+
+    for pr_file in python_files:
+        filename = pr_file.filename
+        print(f"  Scanning: {filename}")
+
+        # --- Fetch full file content at the PR head commit ---
+        # bandit needs syntactically valid, complete Python source.
+        # A raw diff/patch fragment is not valid Python on its own.
+        if pr_file.status == "removed":
+            print("    (file was deleted in this PR — skipping bandit scan)\n")
+            continue
+
+        try:
+            contents = repo.get_contents(filename, ref=head_sha)
+            file_bytes = contents.decoded_content  # bytes
+        except Exception as e:
+            print(f"    Warning: could not fetch full content for {filename}: {e}")
+            print("    Falling back to patch fragment — results may be incomplete.")
+            file_bytes = (pr_file.patch or "").encode("utf-8")
+
+        # --- Write to a named temp file (.py extension required by bandit) ---
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=".py",
+            delete=False,   # we'll delete manually after scanning
+            mode="wb",
+        )
+        try:
+            tmp.write(file_bytes)
+            tmp.flush()
+            tmp.close()
+
+            # --- Run bandit via subprocess with JSON output ---
+            result = subprocess.run(
+                ["bandit", "--format", "json", "--quiet", tmp.name],
+                capture_output=True,
+                text=True,
+            )
+
+            # bandit exits 0 (no issues), 1 (issues found), or 2 (error).
+            # We treat both 0 and 1 as valid JSON output; only 2 is a real error.
+            if result.returncode == 2:
+                print(f"    Error running bandit: {result.stderr.strip()}")
+                continue
+
+            # --- Parse JSON results ---
+            try:
+                report = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                print(f"    Could not parse bandit output: {result.stdout[:200]}")
+                continue
+
+            issues = report.get("results", [])
+
+            if not issues:
+                print("    No issues found.\n")
+            else:
+                print(f"    Found {len(issues)} issue(s):\n")
+                for issue in issues:
+                    print(f"      Line {issue.get('line_number', '?'):>4}  "
+                          f"[{issue.get('issue_severity', '?'):<6} / "
+                          f"{issue.get('issue_confidence', '?'):<6}]  "
+                          f"{issue.get('issue_text', '')}")
+                print()
+
+        finally:
+            # --- Always clean up the temp file ---
+            os.unlink(tmp.name)
 
 
 def main():
@@ -142,6 +233,9 @@ def main():
 
     # Step 3: Test LLM connection (isolated, no diff logic yet)
     test_llm_connection()
+
+    # Step 4: Static security analysis with bandit
+    run_bandit_scan(python_files, repo, pr)
 
 
 if __name__ == "__main__":
