@@ -8,10 +8,48 @@ from dotenv import load_dotenv
 import os
 from github import Github, Auth, GithubException
 from langchain_groq import ChatGroq
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
+from pydantic import BaseModel, Field
+from typing import List
 
 # Load environment variables from .env
 load_dotenv()
+
+
+# ---------------------------------------------------------------------------
+# Pydantic models for structured LLM output
+# ---------------------------------------------------------------------------
+
+class SecurityIssue(BaseModel):
+    """A single security finding judged genuinely concerning by the LLM."""
+    file: str = Field(description="Filename where the issue was found")
+    line_number: int = Field(description="Line number of the issue in the file")
+    description: str = Field(description="Clear description of the security issue")
+    why_it_matters: str = Field(
+        description="1-2 sentences explaining the real-world risk or impact"
+    )
+
+
+class SecurityAgentOutput(BaseModel):
+    """Structured output from the Security Agent LLM call."""
+    overall_severity: str = Field(
+        description=(
+            "Overall severity of real security concerns across all files. "
+            "Must be one of: 'none', 'low', 'medium', 'high', 'critical'."
+        )
+    )
+    real_issues: List[SecurityIssue] = Field(
+        description="Bandit findings the LLM judges as genuinely concerning given the code context"
+    )
+    dismissed_noise: List[str] = Field(
+        description=(
+            "Brief descriptions of bandit findings dismissed as false positives, "
+            "test fixtures, or non-issues given the context."
+        )
+    )
+    reasoning: str = Field(
+        description="2-4 sentences summarising the overall security judgment and key rationale"
+    )
 
 
 def parse_args():
@@ -81,6 +119,9 @@ def run_bandit_scan(python_files, repo, pr):
     print("  BANDIT SECURITY SCAN")
     print(f"{'='*50}\n")
 
+    # Collected results returned to the caller for use by run_security_agent()
+    bandit_results = []   # list of dicts: {filename, issues: [...]}
+
     for pr_file in python_files:
         filename = pr_file.filename
         print(f"  Scanning: {filename}")
@@ -144,9 +185,135 @@ def run_bandit_scan(python_files, repo, pr):
                           f"{issue.get('issue_text', '')}")
                 print()
 
+            bandit_results.append({"filename": filename, "issues": issues})
+
         finally:
             # --- Always clean up the temp file ---
             os.unlink(tmp.name)
+
+    return bandit_results
+
+
+
+def run_security_agent(bandit_results, python_diffs):
+    """
+    Security Agent: combines bandit's raw findings with the actual code diff
+    and asks the LLM to produce a structured security verdict.
+
+    Uses ChatGroq.with_structured_output() so the LLM is forced to respond
+    in the exact shape of SecurityAgentOutput — no free-form text parsing needed.
+
+    Args:
+        bandit_results: list of dicts returned by run_bandit_scan()
+                        [{"filename": ..., "issues": [bandit finding dicts]}, ...]
+        python_diffs:   list of dicts built in main()
+                        [{"filename", "status", "additions", "deletions", "patch"}, ...]
+
+    Returns:
+        SecurityAgentOutput Pydantic object
+    """
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    if not groq_api_key:
+        print("Error: GROQ_API_KEY not found in environment. Check your .env file.")
+        sys.exit(1)
+
+    print(f"\n{'='*50}")
+    print("  SECURITY AGENT (LLM JUDGMENT)")
+    print(f"{'='*50}\n")
+
+    # --- Build the prompt ---
+    # Section 1: bandit findings (all files combined, with severity/confidence labels)
+    bandit_section_lines = []
+    total_issues = 0
+    for entry in bandit_results:
+        fname = entry["filename"]
+        issues = entry["issues"]
+        bandit_section_lines.append(f"File: {fname}")
+        if not issues:
+            bandit_section_lines.append("  bandit: no issues found")
+        else:
+            for iss in issues:
+                total_issues += 1
+                bandit_section_lines.append(
+                    f"  Line {iss.get('line_number', '?')}: "
+                    f"[{iss.get('issue_severity', '?')} / {iss.get('issue_confidence', '?')}] "
+                    f"{iss.get('issue_text', '')} "
+                    f"(test_id: {iss.get('test_id', '?')})"
+                )
+        bandit_section_lines.append("")
+    bandit_section = "\n".join(bandit_section_lines)
+
+    # Section 2: actual code diff (full patch) for each file — gives the LLM
+    # the real code context so it can judge whether a finding is a real risk
+    # or bandit flagging something benign (e.g., a test mock, an example, etc.)
+    diff_section_lines = []
+    patch_lookup = {d["filename"]: d["patch"] for d in python_diffs}
+    for entry in bandit_results:
+        fname = entry["filename"]
+        patch = patch_lookup.get(fname, "(patch not available)")
+        diff_section_lines.append(f"=== Diff for {fname} ===")
+        diff_section_lines.append(patch)
+        diff_section_lines.append("")
+    diff_section = "\n".join(diff_section_lines)
+
+    user_prompt = f"""You are a senior security-focused code reviewer. Below are:
+1. Static analysis findings from bandit for each changed Python file in this pull request.
+2. The actual code diff (patch) for each file, so you can judge each finding in context.
+
+Your job:
+- Identify which bandit findings represent GENUINE security concerns given the actual code.
+- Identify which are likely false positives (e.g., flagged in test fixtures, demo/example code,
+  or patterns that are safe in this specific usage context).
+- Assign an overall severity across all real findings: one of none / low / medium / high / critical.
+- Write 2-4 sentences of reasoning explaining your overall judgment.
+
+--- BANDIT FINDINGS ({total_issues} total) ---
+{bandit_section}
+--- CODE DIFFS ---
+{diff_section}
+"""
+
+    # --- Create the structured LLM client ---
+    # with_structured_output() wraps the LLM so its response is parsed directly
+    # into a SecurityAgentOutput Pydantic object — the LLM cannot return
+    # free-form text; it must conform to the schema.
+    base_llm = ChatGroq(
+        model="llama-3.3-70b-versatile",
+        api_key=groq_api_key,
+    )
+    structured_llm = base_llm.with_structured_output(SecurityAgentOutput)
+
+    system_msg = SystemMessage(
+        content="You are an expert Python security reviewer. Always respond with structured "
+                "JSON conforming exactly to the provided schema."
+    )
+
+    print(f"  Sending {total_issues} bandit finding(s) + diff context to LLM...")
+    result: SecurityAgentOutput = structured_llm.invoke(
+        [system_msg, HumanMessage(content=user_prompt)]
+    )
+
+    # --- Pretty-print the structured result ---
+    print(f"\n  Overall Severity : {result.overall_severity.upper()}")
+    print(f"  Reasoning        : {result.reasoning}")
+
+    print(f"\n  Real Issues ({len(result.real_issues)}):")
+    if result.real_issues:
+        for issue in result.real_issues:
+            print(f"    [{issue.file}:{issue.line_number}] {issue.description}")
+            print(f"      Why it matters: {issue.why_it_matters}")
+    else:
+        print("    (none)")
+
+    print(f"\n  Dismissed as Noise ({len(result.dismissed_noise)}):")
+    if result.dismissed_noise:
+        for note in result.dismissed_noise:
+            print(f"    - {note}")
+    else:
+        print("    (none)")
+
+    print(f"\n{'='*50}\n")
+    return result
 
 
 def main():
@@ -235,7 +402,13 @@ def main():
     test_llm_connection()
 
     # Step 4: Static security analysis with bandit
-    run_bandit_scan(python_files, repo, pr)
+    bandit_results = run_bandit_scan(python_files, repo, pr)
+
+    # Step 5: Security Agent — LLM judges bandit findings against the diff
+    if bandit_results:
+        run_security_agent(bandit_results, python_diffs)
+    else:
+        print("\n[INFO] No bandit results to analyse — skipping Security Agent.")
 
 
 if __name__ == "__main__":
