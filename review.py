@@ -3,14 +3,16 @@ import json
 import subprocess
 import sys
 import tempfile
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 import os
 from github import Github, Auth, GithubException
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.graph import StateGraph, END
 from pydantic import BaseModel, Field
-from typing import List
+from typing_extensions import TypedDict
 
 # Load environment variables from .env
 load_dotenv()
@@ -52,6 +54,37 @@ class SecurityAgentOutput(BaseModel):
     )
 
 
+# ---------------------------------------------------------------------------
+# LangGraph shared state schema
+# ---------------------------------------------------------------------------
+
+class PRReviewState(TypedDict, total=False):
+    """
+    Shared state object passed between every node in the LangGraph.
+
+    Each node receives the full state, does its work, and returns a dict
+    with only the fields it wants to update.  LangGraph merges those updates
+    back into the state before passing it to the next node.
+
+    Fields
+    ------
+    repo_name             : "owner/reponame" string from CLI
+    pr_number             : PR number integer from CLI
+    repo                  : PyGithub Repository object (set in main, passed via state)
+    pr                    : PyGithub PullRequest object
+    python_files          : raw PullRequestFile list from pr.get_files()
+    diff_files            : list of dicts {filename, status, additions, deletions, patch}
+    bandit_results        : output of run_bandit_scan()
+    security_agent_output : SecurityAgentOutput Pydantic object from run_security_agent()
+    """
+    repo_name: str
+    pr_number: int
+    repo: Any                           # PyGithub Repository — not JSON-serialisable, kept in memory
+    pr: Any                             # PyGithub PullRequest
+    python_files: List[Any]             # PullRequestFile objects
+    diff_files: List[Dict[str, Any]]    # [{filename, status, additions, deletions, patch}, ...]
+    bandit_results: List[Dict[str, Any]]
+    security_agent_output: Optional[SecurityAgentOutput]
 def parse_args():
     parser = argparse.ArgumentParser(description="PR Review Agent — fetch PR metadata")
     parser.add_argument("--repo", required=True, help="Repository in 'owner/reponame' format")
@@ -60,43 +93,64 @@ def parse_args():
 
 
 def test_llm_connection():
-    """Send a hardcoded prompt to Groq and print the response + token usage."""
+    """Verify GROQ_API_KEY is present and the ChatGroq client can be instantiated."""
     groq_api_key = os.getenv("GROQ_API_KEY")
     if not groq_api_key:
         print("Error: GROQ_API_KEY not found in environment. Check your .env file.")
         sys.exit(1)
+    # Instantiate the client — if the key is malformed this raises immediately.
+    ChatGroq(model="llama-3.3-70b-versatile", api_key=groq_api_key)
+    print("[OK] Groq LLM client initialised successfully.")
 
-    print(f"\n{'='*50}")
-    print("  LLM CONNECTION TEST")
-    print(f"{'='*50}")
 
-    # ChatGroq is a LangChain wrapper around the Groq cloud API.
-    # It handles auth, request formatting, and response parsing for us.
-    # "llama-3.3-70b-versatile" = Meta's Llama 3.3 model, 70 billion parameters,
-    # hosted on Groq's ultra-fast inference hardware (LPU chips).
-    llm = ChatGroq(
-        model="llama-3.3-70b-versatile",
-        api_key=groq_api_key,
+def security_agent_node(state: PRReviewState) -> PRReviewState:
+    """
+    LangGraph node — Security Agent.
+
+    Reads diff_files, python_files, repo, and pr from state.
+    Runs bandit on every Python file, then calls the LLM security agent
+    to judge the findings.  Writes bandit_results and security_agent_output
+    back into state.
+    """
+    print("\n[GRAPH] Entering node: security_agent_node")
+
+    bandit_results = run_bandit_scan(
+        state["python_files"],
+        state["repo"],
+        state["pr"],
     )
 
-    prompt = "In one sentence, explain what a pull request is."
-    print(f"  Prompt  : {prompt}")
-
-    # llm.invoke() sends the message list to Groq and returns an AIMessage object.
-    response = llm.invoke([HumanMessage(content=prompt)])
-
-    print(f"  Response: {response.content}")
-
-    # Token usage is attached to response.response_metadata by langchain-groq
-    usage = response.response_metadata.get("token_usage", {})
-    if usage:
-        print(f"  Tokens  : {usage.get('prompt_tokens', '?')} prompt "
-              f"+ {usage.get('completion_tokens', '?')} completion "
-              f"= {usage.get('total_tokens', '?')} total")
+    if bandit_results:
+        security_output = run_security_agent(bandit_results, state["diff_files"])
     else:
-        print("  Tokens  : (usage metadata not available)")
+        print("\n[INFO] No bandit results to analyse — skipping Security Agent.")
+        security_output = None
 
-    print(f"{'='*50}\n")
+    return {
+        **state,
+        "bandit_results": bandit_results,
+        "security_agent_output": security_output,
+    }
+
+
+def build_graph() -> StateGraph:
+    """
+    Build and compile the LangGraph StateGraph.
+
+    Currently contains a single node (security_agent_node) which is both
+    the entry point and the only step before END.  Adding a second parallel
+    node later is as simple as calling graph.add_node() and graph.add_edge().
+    """
+    graph = StateGraph(PRReviewState)
+
+    # Register nodes
+    graph.add_node("security_agent_node", security_agent_node)
+
+    # Execution path: START ─► security_agent_node ─► END
+    graph.set_entry_point("security_agent_node")
+    graph.add_edge("security_agent_node", END)
+
+    return graph.compile()
 
 
 def run_bandit_scan(python_files, repo, pr):
@@ -324,6 +378,9 @@ def main():
         print("Error: GITHUB_TOKEN not found in environment. Check your .env file.")
         sys.exit(1)
 
+    # Step 1: Verify LLM client (quick, no API call)
+    test_llm_connection()
+
     g = Github(auth=Auth.Token(token))
 
     # Fetch repo
@@ -346,7 +403,7 @@ def main():
             print(f"Error fetching PR: {e.data.get('message', str(e))}")
         sys.exit(1)
 
-    # Print PR metadata
+    # Step 2: Print PR metadata
     print(f"\n{'='*50}")
     print(f"  PR #{pr.number}: {pr.title}")
     print(f"{'='*50}")
@@ -357,7 +414,7 @@ def main():
     print(f"  Deletions    : -{pr.deletions}")
     print(f"{'='*50}\n")
 
-    # Fetch changed files and filter to Python-only
+    # Step 3: Fetch changed files and build diff list (Python-only)
     print("Fetching changed files...\n")
     files = list(pr.get_files())
 
@@ -368,10 +425,8 @@ def main():
     print(f"  Python files found: {len(python_files)}")
     print(f"  Non-Python files skipped: {skipped_count}\n")
 
-    # In-memory storage for full diff data (passed to agents later)
-    python_diffs = []
+    diff_files = []
 
-    # Print details for each Python file
     print(f"{'='*50}")
     print("  CHANGED PYTHON FILES")
     print(f"{'='*50}\n")
@@ -387,8 +442,7 @@ def main():
         print(f"  Patch (truncated to 500 chars):\n{truncated_patch}")
         print(f"\n{'-'*50}\n")
 
-        # Store full (non-truncated) diff data
-        python_diffs.append({
+        diff_files.append({
             "filename": f.filename,
             "status": f.status,
             "additions": f.additions,
@@ -396,19 +450,38 @@ def main():
             "patch": patch,
         })
 
-    print(f"[INFO] Stored full diff data for {len(python_diffs)} Python file(s) in memory.")
+    print(f"[INFO] Stored full diff data for {len(diff_files)} Python file(s) in memory.")
 
-    # Step 3: Test LLM connection (isolated, no diff logic yet)
-    test_llm_connection()
+    # Step 4 + 5: Run the LangGraph — bandit scan + security agent inside the graph
+    print("\n[GRAPH] Building and invoking the PR Review StateGraph...")
+    graph = build_graph()
 
-    # Step 4: Static security analysis with bandit
-    bandit_results = run_bandit_scan(python_files, repo, pr)
+    initial_state: PRReviewState = {
+        "repo_name": args.repo,
+        "pr_number": args.pr,
+        "repo": repo,
+        "pr": pr,
+        "python_files": python_files,
+        "diff_files": diff_files,
+        "bandit_results": [],
+        "security_agent_output": None,
+    }
 
-    # Step 5: Security Agent — LLM judges bandit findings against the diff
-    if bandit_results:
-        run_security_agent(bandit_results, python_diffs)
+    final_state: PRReviewState = graph.invoke(initial_state)
+
+    # Print final structured output from state
+    sec_out: Optional[SecurityAgentOutput] = final_state.get("security_agent_output")
+    if sec_out:
+        print(f"\n{'='*50}")
+        print("  FINAL SECURITY VERDICT (from graph state)")
+        print(f"{'='*50}")
+        print(f"  Overall Severity : {sec_out.overall_severity.upper()}")
+        print(f"  Reasoning        : {sec_out.reasoning}")
+        print(f"  Real Issues      : {len(sec_out.real_issues)}")
+        print(f"  Dismissed Noise  : {len(sec_out.dismissed_noise)}")
+        print(f"{'='*50}\n")
     else:
-        print("\n[INFO] No bandit results to analyse — skipping Security Agent.")
+        print("\n[INFO] No security output in final graph state.")
 
 
 if __name__ == "__main__":
