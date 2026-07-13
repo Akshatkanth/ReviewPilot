@@ -10,7 +10,7 @@ import os
 from github import Github, Auth, GithubException
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
-from langgraph.graph import StateGraph, END
+from langgraph.graph import StateGraph, START, END
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
@@ -54,6 +54,40 @@ class SecurityAgentOutput(BaseModel):
     )
 
 
+class CoverageGap(BaseModel):
+    """A single coverage gap in the changed files, with risk assessment."""
+    file: str = Field(description="Filename with the coverage gap")
+    uncovered_lines: List[int] = Field(description="List of line numbers not covered by tests")
+    risk_note: str = Field(
+        description="Brief note on the risk of these specific lines being untested"
+    )
+
+class CoverageAgentOutput(BaseModel):
+    """Structured output from the Coverage Agent LLM call."""
+    overall_risk: str = Field(
+        description="Overall risk from missing coverage. Must be: 'none', 'low', 'medium', 'high'."
+    )
+    files_with_gaps: List[CoverageGap] = Field(
+        description="List of files with missing coverage and risk assessments"
+    )
+    reasoning: str = Field(
+        description="2-4 sentences explaining why the untested lines matter (or don't)"
+    )
+
+class RiskVerdict(BaseModel):
+    """Final aggregated verdict from the Risk Aggregator LLM call."""
+    risk_score: int = Field(description="A score from 0 to 100 representing overall PR risk")
+    recommendation: str = Field(
+        description="Final decision: 'ready', 'needs_changes', or 'block'"
+    )
+    blocking_issues: List[str] = Field(
+        description="List of specific issues that must be addressed before merging, if any"
+    )
+    summary: str = Field(
+        description="3-5 sentences written as if explaining to a human reviewer"
+    )
+
+
 # ---------------------------------------------------------------------------
 # LangGraph shared state schema
 # ---------------------------------------------------------------------------
@@ -76,6 +110,9 @@ class PRReviewState(TypedDict, total=False):
     diff_files            : list of dicts {filename, status, additions, deletions, patch}
     bandit_results        : output of run_bandit_scan()
     security_agent_output : SecurityAgentOutput Pydantic object from run_security_agent()
+    coverage_results      : dict with 'has_tests' and 'coverage_data'
+    coverage_agent_output : CoverageAgentOutput Pydantic object
+    risk_verdict          : RiskVerdict Pydantic object
     """
     repo_name: str
     pr_number: int
@@ -85,6 +122,11 @@ class PRReviewState(TypedDict, total=False):
     diff_files: List[Dict[str, Any]]    # [{filename, status, additions, deletions, patch}, ...]
     bandit_results: List[Dict[str, Any]]
     security_agent_output: Optional[SecurityAgentOutput]
+    coverage_results: Dict[str, Any]
+    coverage_agent_output: Optional[CoverageAgentOutput]
+    risk_verdict: Optional[RiskVerdict]
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="PR Review Agent — fetch PR metadata")
     parser.add_argument("--repo", required=True, help="Repository in 'owner/reponame' format")
@@ -103,14 +145,155 @@ def test_llm_connection():
     print("[OK] Groq LLM client initialised successfully.")
 
 
+def run_security_agent(bandit_results, python_diffs):
+    """
+    Security Agent: takes raw bandit findings and the PR diffs,
+    and asks the LLM to filter for genuine security issues.
+    """
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    if not groq_api_key:
+        print("Error: GROQ_API_KEY not found in environment.")
+        sys.exit(1)
+
+    print(f"\n{'='*50}")
+    print("  SECURITY AGENT (LLM JUDGMENT)")
+    print(f"{'='*50}\n")
+
+    # Construct the context for the LLM
+    context = "Files being reviewed:\n"
+    for diff in python_diffs:
+        context += f"Filename: {diff['filename']}\nPatch snippet:\n{diff['patch']}\n\n"
+
+    prompt = f"""You are a senior security engineer. Analyze the following Bandit security tool findings within the context of the provided code diffs.
+Identify which findings are real security vulnerabilities, which are false positives, and which are noise (like test files).
+
+--- CODE DIFFS ---
+{context}
+
+--- BANDIT FINDINGS ---
+{json.dumps(bandit_results, indent=2)}
+"""
+
+    base_llm = ChatGroq(model="llama-3.3-70b-versatile", api_key=groq_api_key)
+    structured_llm = base_llm.with_structured_output(SecurityAgentOutput)
+
+    system_msg = SystemMessage(
+        content="You are an expert security reviewer. Respond only with structured JSON."
+    )
+
+    result: SecurityAgentOutput = structured_llm.invoke(
+        [system_msg, HumanMessage(content=prompt)]
+    )
+
+    print(f"  Overall Severity: {result.overall_severity.upper()}")
+    print(f"  Issues Found    : {len(result.real_issues)}")
+    print(f"{'='*50}\n")
+    return result
+
+
+def run_coverage_agent(coverage_results, python_diffs):
+    """
+    Coverage Agent: combines missing coverage lines with actual code diff
+    and asks the LLM to judge the risk of those untested lines.
+    """
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    if not groq_api_key:
+        print("Error: GROQ_API_KEY not found in environment.")
+        sys.exit(1)
+
+    print(f"\n{'='*50}")
+    print("  COVERAGE AGENT (LLM JUDGMENT)")
+    print(f"{'='*50}\n")
+
+    if not coverage_results.get("has_tests"):
+        print("  [INFO] No tests or no coverage data found. Generating fallback report...")
+        # If there are no tests, we still want the agent to output a result
+        base_llm = ChatGroq(model="llama-3.3-70b-versatile", api_key=groq_api_key)
+        structured_llm = base_llm.with_structured_output(CoverageAgentOutput)
+        prompt = (
+            "The repository has no tests or tests failed to run. "
+            "Please assess the overall risk of merging untested code based on these diffs:\n\n"
+        )
+        for d in python_diffs:
+            prompt += f"=== {d['filename']} ===\n{d['patch']}\n\n"
+        
+        result = structured_llm.invoke([
+            SystemMessage(content="You are an expert QA and code reviewer."),
+            HumanMessage(content=prompt)
+        ])
+        return result
+
+    cov_data = coverage_results.get("coverage_data", [])
+    if not cov_data:
+        # All changed files are covered
+        print("  [INFO] 100% coverage on changed files! Returning zero-risk output.")
+        return CoverageAgentOutput(
+            overall_risk="none",
+            files_with_gaps=[],
+            reasoning="All modified lines in the examined files are fully covered by tests. Great job!"
+        )
+
+    # Build prompt for files with missing coverage
+    cov_section = ""
+    total_gaps = 0
+    for item in cov_data:
+        fname = item["file"]
+        missing = item["missing_lines"]
+        total_gaps += len(missing)
+        cov_section += f"File: {fname}\n  Uncovered lines: {missing}\n\n"
+
+    diff_section_lines = []
+    patch_lookup = {d["filename"]: d["patch"] for d in python_diffs}
+    for item in cov_data:
+        fname = item["file"]
+        patch = patch_lookup.get(fname, "(patch not available)")
+        diff_section_lines.append(f"=== Diff for {fname} ===")
+        diff_section_lines.append(patch)
+        diff_section_lines.append("")
+    diff_section = "\n".join(diff_section_lines)
+
+    user_prompt = f"""You are a senior QA engineer and code reviewer. Below are:
+1. Coverage report showing which lines in the modified files are NOT covered by tests.
+2. The actual code diff (patch) for each file.
+
+Your job:
+- Identify the logic on the uncovered lines.
+- Assess how risky it is that these specific lines are untested (e.g. is it core business logic, or just a simple print statement?).
+- Assign an overall risk for the missing coverage: none / low / medium / high.
+- Provide reasoning.
+
+--- UNCOVERED LINES ---
+{cov_section}
+--- CODE DIFFS ---
+{diff_section}
+"""
+
+    base_llm = ChatGroq(model="llama-3.3-70b-versatile", api_key=groq_api_key)
+    structured_llm = base_llm.with_structured_output(CoverageAgentOutput)
+
+    system_msg = SystemMessage(
+        content="You are an expert Python QA reviewer. Always respond with structured "
+                "JSON conforming exactly to the provided schema."
+    )
+
+    print(f"  Sending {total_gaps} uncovered line(s) + diff context to LLM...")
+    result: CoverageAgentOutput = structured_llm.invoke(
+        [system_msg, HumanMessage(content=user_prompt)]
+    )
+
+    print(f"\n  Overall Risk : {result.overall_risk.upper()}")
+    print(f"  Reasoning    : {result.reasoning}")
+    if result.files_with_gaps:
+        for gap in result.files_with_gaps:
+            print(f"    - {gap.file}: {gap.uncovered_lines}")
+            print(f"      Risk: {gap.risk_note}")
+    print(f"\n{'='*50}\n")
+    return result
+
+
 def security_agent_node(state: PRReviewState) -> PRReviewState:
     """
     LangGraph node — Security Agent.
-
-    Reads diff_files, python_files, repo, and pr from state.
-    Runs bandit on every Python file, then calls the LLM security agent
-    to judge the findings.  Writes bandit_results and security_agent_output
-    back into state.
     """
     print("\n[GRAPH] Entering node: security_agent_node")
 
@@ -127,9 +310,95 @@ def security_agent_node(state: PRReviewState) -> PRReviewState:
         security_output = None
 
     return {
-        **state,
         "bandit_results": bandit_results,
         "security_agent_output": security_output,
+    }
+
+
+def coverage_agent_node(state: PRReviewState) -> PRReviewState:
+    """
+    LangGraph node — Coverage Agent.
+    """
+    print("\n[GRAPH] Entering node: coverage_agent_node")
+
+    coverage_results = run_coverage_scan(
+        state["python_files"],
+        state["repo"],
+        state["pr"],
+    )
+
+    coverage_output = run_coverage_agent(coverage_results, state["diff_files"])
+
+    return {
+        "coverage_results": coverage_results,
+        "coverage_agent_output": coverage_output,
+    }
+
+
+def run_risk_aggregator(security_output, coverage_output):
+    """
+    Risk Aggregator: synthesizes the findings of the Security and Coverage agents
+    into a final RiskVerdict.
+    """
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    if not groq_api_key:
+        print("Error: GROQ_API_KEY not found in environment.")
+        sys.exit(1)
+
+    print(f"\n{'='*50}")
+    print("  RISK AGGREGATOR (SYNTHESIS)")
+    print(f"{'='*50}\n")
+
+    # Serialize agent outputs to pass to the LLM
+    sec_json = security_output.model_dump_json() if security_output else "{}"
+    cov_json = coverage_output.model_dump_json() if coverage_output else "{}"
+
+    prompt = f"""You are the Lead Code Reviewer. You have received reports from two specialized agents:
+1. Security Agent
+2. Test Coverage Agent
+
+Your job is to synthesize these reports into a final `RiskVerdict` for the pull request.
+Consider:
+- High severity security issues should likely 'block' the PR.
+- Critical logic with no coverage might 'need_changes' or 'block'.
+- If both are clear, the PR is 'ready'.
+
+--- SECURITY AGENT OUTPUT ---
+{sec_json}
+
+--- COVERAGE AGENT OUTPUT ---
+{cov_json}
+"""
+
+    base_llm = ChatGroq(model="llama-3.3-70b-versatile", api_key=groq_api_key)
+    structured_llm = base_llm.with_structured_output(RiskVerdict)
+
+    system_msg = SystemMessage(
+        content="You are a Lead Code Reviewer. Always respond with structured JSON."
+    )
+
+    print("  Synthesizing final risk verdict...")
+    result: RiskVerdict = structured_llm.invoke([system_msg, HumanMessage(content=prompt)])
+    
+    print(f"  Final Recommendation: {result.recommendation.upper()}")
+    print(f"{'='*50}\n")
+    return result
+
+
+def risk_aggregator_node(state: PRReviewState) -> PRReviewState:
+    """
+    LangGraph node — Risk Aggregator.
+    Runs after both security and coverage nodes have completed.
+    """
+    print("\n[GRAPH] Entering node: risk_aggregator_node")
+    
+    risk_verdict = run_risk_aggregator(
+        state.get("security_agent_output"),
+        state.get("coverage_agent_output")
+    )
+    
+    return {
+        "risk_verdict": risk_verdict
     }
 
 
@@ -137,18 +406,27 @@ def build_graph() -> StateGraph:
     """
     Build and compile the LangGraph StateGraph.
 
-    Currently contains a single node (security_agent_node) which is both
-    the entry point and the only step before END.  Adding a second parallel
-    node later is as simple as calling graph.add_node() and graph.add_edge().
+    Uses a fan-out/fan-in pattern:
+    START ─┬─► security_agent_node ─┬─► risk_aggregator_node ─► END
+           └─► coverage_agent_node ─┘
     """
     graph = StateGraph(PRReviewState)
 
     # Register nodes
     graph.add_node("security_agent_node", security_agent_node)
+    graph.add_node("coverage_agent_node", coverage_agent_node)
+    graph.add_node("risk_aggregator_node", risk_aggregator_node)
 
-    # Execution path: START ─► security_agent_node ─► END
-    graph.set_entry_point("security_agent_node")
-    graph.add_edge("security_agent_node", END)
+    # Parallel fan-out from START
+    graph.add_edge(START, "security_agent_node")
+    graph.add_edge(START, "coverage_agent_node")
+    
+    # Fan-in to the aggregator
+    graph.add_edge("security_agent_node", "risk_aggregator_node")
+    graph.add_edge("coverage_agent_node", "risk_aggregator_node")
+    
+    # Execution path finishes after aggregator
+    graph.add_edge("risk_aggregator_node", END)
 
     return graph.compile()
 
@@ -247,6 +525,85 @@ def run_bandit_scan(python_files, repo, pr):
 
     return bandit_results
 
+
+def run_coverage_scan(python_files, repo, pr):
+    """
+    Clones the PR head repo into a temp directory and runs coverage.
+    Returns:
+        dict: {"has_tests": bool, "coverage_data": [{"file": str, "missing_lines": list[int]}, ...]}
+    """
+    print(f"\n{'='*50}")
+    print("  TEST COVERAGE SCAN")
+    print(f"{'='*50}\n")
+
+    target_files = [f.filename for f in python_files if f.status != "removed"]
+    if not target_files:
+        print("  No Python files to check coverage for.\n")
+        return {"has_tests": False, "coverage_data": []}
+
+    clone_url = pr.head.repo.clone_url
+    head_ref = pr.head.ref
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        print(f"  Cloning {clone_url} branch {head_ref}...")
+        try:
+            # Clone only the specific branch, depth 1
+            subprocess.run(
+                ["git", "clone", "--depth", "1", "--branch", head_ref, clone_url, "."],
+                cwd=tmpdir, check=True, capture_output=True, text=True
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"  Warning: failed to clone repo: {e.stderr}")
+            return {"has_tests": False, "coverage_data": []}
+
+        print("  Running tests with coverage...")
+        # Fallback to unittest discover if pytest is missing, 
+        # but coverage module is assumed present.
+        subprocess.run(
+            [sys.executable, "-m", "coverage", "run", "-m", "unittest", "discover"],
+            cwd=tmpdir, capture_output=True, text=True
+        )
+        subprocess.run(
+            [sys.executable, "-m", "coverage", "json"],
+            cwd=tmpdir, capture_output=True, text=True
+        )
+
+        cov_file = os.path.join(tmpdir, "coverage.json")
+        if not os.path.exists(cov_file):
+            print("  Warning: coverage.json not generated. Likely no tests found.")
+            return {"has_tests": False, "coverage_data": []}
+
+        print("  Parsing coverage results...")
+        try:
+            with open(cov_file, "r") as f:
+                cov_report = json.load(f)
+        except Exception as e:
+            print(f"  Warning: failed to read coverage.json: {e}")
+            return {"has_tests": False, "coverage_data": []}
+
+        coverage_data = []
+        cov_files = cov_report.get("files", {})
+
+        for fname in target_files:
+            # Map github filename to coverage.json keys
+            file_cov = cov_files.get(fname)
+            if not file_cov:
+                for k, v in cov_files.items():
+                    if k.endswith(fname):
+                        file_cov = v
+                        break
+
+            if file_cov:
+                missing = file_cov.get("missing_lines", [])
+                if missing:
+                    coverage_data.append({"file": fname, "missing_lines": missing})
+
+        if not coverage_data:
+            print("  No missing coverage found for the changed files!\n")
+        else:
+            print(f"  Found missing coverage in {len(coverage_data)} file(s).\n")
+
+        return {"has_tests": True, "coverage_data": coverage_data}
 
 
 def run_security_agent(bandit_results, python_diffs):
@@ -465,23 +822,32 @@ def main():
         "diff_files": diff_files,
         "bandit_results": [],
         "security_agent_output": None,
+        "coverage_results": {},
+        "coverage_agent_output": None,
+        "risk_verdict": None,
     }
 
     final_state: PRReviewState = graph.invoke(initial_state)
 
     # Print final structured output from state
-    sec_out: Optional[SecurityAgentOutput] = final_state.get("security_agent_output")
-    if sec_out:
+    risk: Optional[RiskVerdict] = final_state.get("risk_verdict")
+    if risk:
         print(f"\n{'='*50}")
-        print("  FINAL SECURITY VERDICT (from graph state)")
+        print("  FINAL AGGREGATED RISK VERDICT (from graph state)")
         print(f"{'='*50}")
-        print(f"  Overall Severity : {sec_out.overall_severity.upper()}")
-        print(f"  Reasoning        : {sec_out.reasoning}")
-        print(f"  Real Issues      : {len(sec_out.real_issues)}")
-        print(f"  Dismissed Noise  : {len(sec_out.dismissed_noise)}")
+        print(f"  Recommendation : {risk.recommendation.upper()}")
+        print(f"  Risk Score     : {risk.risk_score} / 100")
+        print(f"  Summary        : {risk.summary}")
+        
+        if risk.blocking_issues:
+            print(f"\n  Blocking Issues ({len(risk.blocking_issues)}):")
+            for issue in risk.blocking_issues:
+                print(f"    - {issue}")
+        else:
+            print("\n  Blocking Issues: None")
         print(f"{'='*50}\n")
     else:
-        print("\n[INFO] No security output in final graph state.")
+        print("\n[INFO] No risk verdict in final graph state.")
 
 
 if __name__ == "__main__":
